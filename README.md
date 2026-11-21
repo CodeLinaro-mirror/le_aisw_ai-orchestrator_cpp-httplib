@@ -933,7 +933,7 @@ With it:
 - When the [max queued requests](#max-queued-requests) limit is reached, only a connection that has not been served yet is closed. An established one waits for room.
 - Each request pays for handing the connection over, so with no more connections than threads and very light handlers, it can serve fewer requests per second.
 - A handler, a content provider and a WebSocket still hold their thread while they run.
-- `SSLServer` ignores it for now, and an override of `process_and_close_socket()` is not called.
+- `SSLServer` ignores it for now.
 
 ### Client address behind a reverse proxy
 

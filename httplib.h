@@ -2534,6 +2534,7 @@ private:
   bool accept_loop(TaskQueue &task_queue);
   bool parking_loop(TaskQueue &task_queue);
   void prepare_accepted_socket(socket_t sock) const;
+  struct PlainConnection;
   void resume_connection(std::shared_ptr<KeepAliveConnection> conn);
   bool abandon_listen_socket();
 
@@ -2584,6 +2585,9 @@ private:
 
   virtual bool process_and_close_socket(socket_t sock);
   virtual bool supports_keep_alive_parking() const;
+  // The connection that parking_loop() keeps for a socket it has accepted.
+  virtual std::shared_ptr<KeepAliveConnection>
+  new_keep_alive_connection(socket_t sock);
 
   void output_log(const Request &req, const Response &res) const;
   void output_pre_compression_log(const Request &req,
@@ -14306,29 +14310,125 @@ WebSocketSSLStream::set_read_interrupt(std::function<bool()> interrupted) {
  */
 
 // A kept-alive connection that the event loop of set_keep_alive_parking()
-// owns while it is idle, and a worker owns while it serves a request.
+// owns while it is idle, and a worker owns while it serves a request. A
+// derived class adds the transport: the stream, and for TLS the session.
 struct Server::KeepAliveConnection {
-  KeepAliveConnection(socket_t s, const Server &svr)
-      : sock(s), strm(s, svr.read_timeout_sec_, svr.read_timeout_usec_,
-                      svr.write_timeout_sec_, svr.write_timeout_usec_) {}
-  ~KeepAliveConnection() {
+  KeepAliveConnection(socket_t s, Server &server) : svr(server), sock(s) {}
+  // Every owner closes it before letting go, which the transport hooks need;
+  // this is only a net, which cannot reach them any more.
+  virtual ~KeepAliveConnection() {
     if (sock != INVALID_SOCKET) { detail::drain_and_close_socket(sock, 0); }
   }
 
-  socket_t sock;
-  // Kept across requests: it may hold the start of a pipelined request.
-  detail::SocketStream strm;
-  size_t served = 0;
+  // On a worker before the first request, e.g. for a TLS handshake. False
+  // closes the connection.
+  virtual bool open() { return true; }
+  // Serves requests while they come: serve_on() with the transport's stream.
+  virtual bool serve() = 0;
+  // Before it is parked. Nothing is buffered then.
+  virtual void release_buffers() {}
+  // Before the socket of an open connection is closed, e.g. to send TLS
+  // close_notify.
+  virtual void shut_down(bool /*graceful*/) {}
 
-  bool addresses_known = false;
-  std::string remote_addr;
+  // On a worker, once the event loop has seen the socket readable. Afterwards
+  // turn.park tells whether it may be parked again.
+  bool resume() {
+    turn = Turn();
+    return svr.serve_guarded([this]() {
+      if (!opened) {
+        detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+        detail::get_local_ip_and_port(sock, local_addr, local_port);
+        if (!open()) { return false; }
+        opened = true;
+      }
+      return serve();
+    });
+  }
+
+  // From the event loop, which must not wait for the peer.
+  void close_idle() {
+    if (sock == INVALID_SOCKET) { return; }
+    if (opened) {
+      detail::set_nonblocking(sock, true);
+      shut_down(true);
+    }
+    detail::drain_and_close_socket(sock, 0);
+    sock = INVALID_SOCKET;
+  }
+
+  // From the worker that served it.
+  void close_served(bool graceful) {
+    if (opened) {
+      shut_down(graceful);
+      detail::drain_and_close_socket(sock);
+    } else {
+      // It never got as far as a request, e.g. a failed TLS handshake.
+      detail::shutdown_socket(sock);
+      detail::close_socket(sock);
+    }
+    sock = INVALID_SOCKET;
+  }
+
+  template <typename S>
+  bool serve_on(S &strm,
+                const std::function<void(Request &)> &setup_request = nullptr) {
+    return detail::process_server_socket_core(
+        strm, served, svr.keep_alive_max_count_,
+        [this]() { return wait_for_next_request(); },
+        [&](Stream &s, bool close_connection, bool &connection_closed) {
+          return svr.process_request(s, remote_addr, remote_port, local_addr,
+                                     local_port, close_connection,
+                                     connection_closed, setup_request,
+                                     &turn.websocket_upgraded);
+        });
+  }
+
+  bool wait_for_next_request() {
+    // The event loop saw the socket readable just before this ran.
+    if (turn.woken) {
+      turn.woken = false;
+      return true;
+    }
+    if (svr.is_stopping()) { return false; }
+    // Waiting here for a slow client would keep the worker from others.
+    turn.park = detail::select_read(sock, 0, 0) <= 0;
+    return !turn.park;
+  }
+
+  // A worker's time with it, from resume() until it is parked or closed.
+  struct Turn {
+    bool woken = true;
+    bool park = false;
+    bool websocket_upgraded = false;
+  };
+
+  Server &svr;
+  socket_t sock;
   int remote_port = 0;
-  std::string local_addr;
   int local_port = 0;
+  bool opened = false; // by resume(), once open() has succeeded
+  Turn turn;
+  size_t served = 0;
+  std::string remote_addr;
+  std::string local_addr;
 
   // While parked
   std::list<std::shared_ptr<KeepAliveConnection>>::iterator parked_at;
   std::chrono::steady_clock::time_point deadline;
+};
+
+struct Server::PlainConnection final : Server::KeepAliveConnection {
+  PlainConnection(socket_t s, Server &server)
+      : KeepAliveConnection(s, server),
+        strm(s, server.read_timeout_sec_, server.read_timeout_usec_,
+             server.write_timeout_sec_, server.write_timeout_usec_) {}
+
+  bool serve() override { return serve_on(strm); }
+  void release_buffers() override { strm.release_buffer(); }
+
+  // Kept across requests: it may hold the start of a pipelined request.
+  detail::SocketStream strm;
 };
 
 struct Server::ParkingState {
@@ -14388,10 +14488,14 @@ struct Server::ParkingState {
   void expire(Clock::time_point now) {
     while (!parked.empty() && parked.front()->deadline <= now) {
       poller->disarm(parked.front()->sock);
-      parked.pop_front(); // closes it
+      parked.front()->close_idle();
+      parked.pop_front();
     }
   }
 
+  // Closes them here rather than wherever the last reference goes, which may
+  // be a worker that has just given one back, or the destructor, which cannot
+  // reach the transport.
   void close_all() {
     std::vector<Connection> left;
     {
@@ -14401,6 +14505,13 @@ struct Server::ParkingState {
     }
     for (auto &conn : parked) {
       poller->disarm(conn->sock);
+      conn->close_idle();
+    }
+    for (auto &conn : left) {
+      conn->close_idle();
+    }
+    for (auto &conn : backlog) {
+      conn->close_idle();
     }
     parked.clear();
     backlog.clear();
@@ -16464,18 +16575,18 @@ inline bool Server::parking_loop(TaskQueue &task_queue) {
           // Some platforms make it non-blocking like the listening socket.
           detail::set_nonblocking(sock, false);
           prepare_accepted_socket(sock);
-          st.park(std::make_shared<KeepAliveConnection>(sock, *this),
-                  now + keep_alive);
+          st.park(new_keep_alive_connection(sock), now + keep_alive);
           if (idle.count() > 0) { next_idle = now + idle; }
         }
         continue;
       }
 
       auto conn = st.unpark(token);
-      if (conn->served == 0) {
+      if (!conn->opened) {
         // A new connection is turned away when the queue is full, as
-        // accept_loop() does. It is closed when `conn` goes away.
+        // accept_loop() does.
         if (!dispatch(conn)) {
+          conn->close_idle();
           output_error_log(Error::ResourceExhaustion, nullptr);
         }
       } else if (!st.backlog.empty() || !dispatch(conn)) {
@@ -16507,49 +16618,24 @@ inline bool Server::parking_loop(TaskQueue &task_queue) {
   return !(fatal && abandon_listen_socket());
 }
 
+inline std::shared_ptr<Server::KeepAliveConnection>
+Server::new_keep_alive_connection(socket_t sock) {
+  return std::make_shared<PlainConnection>(sock, *this);
+}
+
 inline void
 Server::resume_connection(std::shared_ptr<KeepAliveConnection> conn) {
   auto &c = *conn;
-  if (!c.addresses_known) {
-    detail::get_remote_ip_and_port(c.sock, c.remote_addr, c.remote_port);
-    detail::get_local_ip_and_port(c.sock, c.local_addr, c.local_port);
-    c.addresses_known = true;
-  }
-
-  auto woken_by_poller = true;
-  auto park = false;
-  auto websocket_upgraded = false;
-  serve_guarded([&]() {
-    return detail::process_server_socket_core(
-        c.strm, c.served, keep_alive_max_count_,
-        [&]() {
-          // parking_loop() saw the socket readable just before this ran.
-          if (woken_by_poller) {
-            woken_by_poller = false;
-            return true;
-          }
-          if (is_stopping()) { return false; }
-          // Waiting here for a slow client would keep the worker from others.
-          park = detail::select_read(c.sock, 0, 0) <= 0;
-          return !park;
-        },
-        [&](Stream &strm, bool close_connection, bool &connection_closed) {
-          return process_request(strm, c.remote_addr, c.remote_port,
-                                 c.local_addr, c.local_port, close_connection,
-                                 connection_closed, nullptr,
-                                 &websocket_upgraded);
-        });
-  });
+  auto ret = c.resume();
 
   auto &st = *parking_;
   // A backlog waits for a free worker, and this one is about to be free.
   if (st.backlog_waiting) { st.poller->wake(); }
-  if (park) {
-    c.strm.release_buffer(); // it may stay idle for long
+  if (c.turn.park) {
+    c.release_buffers(); // it may stay idle for long
     if (st.give_back(conn)) { return; }
   }
-  detail::drain_and_close_socket(c.sock);
-  c.sock = INVALID_SOCKET;
+  c.close_served(!c.turn.websocket_upgraded && ret);
 }
 
 inline void Server::output_log(const Request &req, const Response &res) const {
